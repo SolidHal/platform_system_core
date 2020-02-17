@@ -81,6 +81,7 @@ using namespace std::literals::string_literals;
 
 using android::base::Basename;
 using android::base::StringPrintf;
+using android::base::StartsWith;
 using android::base::unique_fd;
 using android::fs_mgr::Fstab;
 using android::fs_mgr::ReadFstabFromFile;
@@ -701,6 +702,15 @@ static Result<void> do_swapon_all(const BuiltinArguments& args) {
 }
 
 static Result<void> do_setprop(const BuiltinArguments& args) {
+    if (StartsWith(args[1], "ctl.")) {
+        return Error()
+               << "Cannot set ctl. properties from init; call the Service functions directly";
+    }
+    if (args[1] == kRestoreconProperty) {
+        return Error() << "Cannot set '" << kRestoreconProperty
+                       << "' from init; use the restorecon builtin directly";
+    }
+
     property_set(args[1], args[2]);
     return {};
 }

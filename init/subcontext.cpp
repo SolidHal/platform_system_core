@@ -18,16 +18,17 @@
 
 #include <fcntl.h>
 #include <poll.h>
-#include <sys/socket.h>
 #include <unistd.h>
 
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <selinux/android.h>
 
 #include "action.h"
 #include "builtins.h"
+#include "proto_utils.h"
 #include "util.h"
 
 #if defined(__ANDROID__)
@@ -97,7 +98,6 @@ uint32_t SubcontextPropertySet(const std::string& name, const std::string& value
     properties_to_set.emplace_back(name, value);
     return 0;
 }
-
 class SubcontextProcess {
   public:
     SubcontextProcess(const BuiltinFunctionMap* function_map, std::string context, int init_fd)
@@ -130,14 +130,6 @@ void SubcontextProcess::RunCommand(const SubcontextCommand::ExecuteCommand& exec
     } else {
         result = RunBuiltinFunction(map_result->function, args, context_);
     }
-
-    for (const auto& [name, value] : properties_to_set) {
-        auto property = reply->add_properties_to_set();
-        property->set_name(name);
-        property->set_value(value);
-    }
-
-    properties_to_set.clear();
 
     if (result) {
         reply->set_success(true);
@@ -224,7 +216,10 @@ int SubcontextMain(int argc, char** argv, const BuiltinFunctionMap* function_map
 
     SelabelInitialize();
 
-    property_set = SubcontextPropertySet;
+    property_set = [](const std::string& key, const std::string& value) -> uint32_t {
+        android::base::SetProperty(key, value);
+        return 0;
+    };
 
     auto subcontext_process = SubcontextProcess(function_map, context, init_fd);
     subcontext_process.MainLoop();
@@ -309,15 +304,6 @@ Result<void> Subcontext::Execute(const std::vector<std::string>& args) {
     auto subcontext_reply = TransmitMessage(subcontext_command);
     if (!subcontext_reply) {
         return subcontext_reply.error();
-    }
-
-    for (const auto& property : subcontext_reply->properties_to_set()) {
-        ucred cr = {.pid = pid_, .uid = 0, .gid = 0};
-        std::string error;
-        if (HandlePropertySet(property.name(), property.value(), context_, cr, &error) != 0) {
-            LOG(ERROR) << "Subcontext init could not set '" << property.name() << "' to '"
-                       << property.value() << "': " << error;
-        }
     }
 
     if (subcontext_reply->reply_case() == SubcontextReply::kFailure) {

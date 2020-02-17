@@ -25,6 +25,8 @@
 namespace android {
 namespace init {
 
+static constexpr const char kRestoreconProperty[] = "selinux.restorecon_recursive";
+
 bool CanReadProperty(const std::string& source_context, const std::string& name);
 
 extern uint32_t (*property_set)(const std::string& name, const std::string& value);

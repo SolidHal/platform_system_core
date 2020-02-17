@@ -29,6 +29,8 @@
 #include <unistd.h>
 
 #include <functional>
+#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
+#include <sys/_system_properties.h>
 #include <map>
 #include <memory>
 #include <optional>
@@ -61,6 +63,7 @@
 #include "mount_handler.h"
 #include "mount_namespace.h"
 #include "property_service.h"
+#include "proto_utils.h"
 #include "reboot.h"
 #include "reboot_utils.h"
 #include "security.h"
@@ -69,6 +72,7 @@
 #include "service.h"
 #include "service_parser.h"
 #include "sigchld_handler.h"
+#include "system/core/init/property_service.pb.h"
 #include "util.h"
 
 using namespace std::chrono_literals;
@@ -90,6 +94,7 @@ static int property_triggers_enabled = 0;
 static char qemu[32];
 
 static int signal_fd = -1;
+static int property_fd = -1;
 
 static std::unique_ptr<Timer> waiting_for_prop(nullptr);
 static std::string wait_prop_name;
@@ -333,9 +338,6 @@ bool HandleControlMessage(const std::string& msg, const std::string& name, pid_t
                    << "' from pid: " << pid << " (" << process_cmdline << "): " << result.error();
         return false;
     }
-
-    LOG(INFO) << "Control message: Processed ctl." << msg << " for '" << name
-              << "' from pid: " << pid << " (" << process_cmdline << ")";
     return true;
 }
 
@@ -686,7 +688,12 @@ int SecondStageMain(int argc, char** argv) {
     UmountDebugRamdisk();
     fs_mgr_vendor_overlay_mount_all();
     export_oem_lock_status();
-    StartPropertyService(&epoll);
+
+    StartPropertyService(&property_fd);
+    if (auto result = epoll.RegisterHandler(property_fd, HandlePropertyFd); !result) {
+        LOG(FATAL) << "Could not register epoll handler for property fd: " << result.error();
+    }
+
     MountHandler mount_handler(&epoll);
     set_usb_controller();
 

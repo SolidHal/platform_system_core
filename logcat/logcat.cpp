@@ -490,6 +490,7 @@ static void show_help(android_logcat_context_internal* context) {
                     "                  other pruning activity is oldest first. Special case ~!\n"
                     "                  represents an automatic quicker pruning for the noisiest\n"
                     "                  UID as determined by the current statistics.\n"
+                    "  -C              colored output\n"
                     "  -P '<list> ...', --prune='<list> ...'\n"
                     "                  Set prune white and ~black list, using same format as\n"
                     "                  listed above. Must be quoted.\n"
@@ -865,6 +866,7 @@ static int __logcat(android_logcat_context_internal* context) {
           { "dividers",      no_argument,       nullptr, 'D' },
           { "file",          required_argument, nullptr, 'f' },
           { "format",        required_argument, nullptr, 'v' },
+          { "color",         no_argument,       nullptr, 'C' },
           // hidden and undocumented reserved alias for --regex
           { "grep",          required_argument, nullptr, 'e' },
           // hidden and undocumented reserved alias for --max-count
@@ -888,7 +890,7 @@ static int __logcat(android_logcat_context_internal* context) {
         };
         // clang-format on
 
-        int c = getopt_long(argc, argv, ":cdDhLt:T:gG:sQf:r:n:v:b:BSpP:m:e:", long_options,
+        int c = getopt_long(argc, argv, ":cdDhLt:T:gG:sQf:r:n:v:b:BSpCP:m:e:", long_options,
                             &option_index);
         if (c == -1) break;
 
@@ -1060,6 +1062,10 @@ static int __logcat(android_logcat_context_internal* context) {
             case 'P':
                 setPruneList = optarg;
                 break;
+
+            case 'C':
+                setLogFormat(context, "color");
+            break;
 
             case 'b': {
                 std::unique_ptr<char, void (*)(void*)> buffers(strdup(optarg), free);

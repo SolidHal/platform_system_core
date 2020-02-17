@@ -113,10 +113,12 @@ namespace init {
 class ColdBoot {
   public:
     ColdBoot(UeventListener& uevent_listener,
-             std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers)
+             std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers,
+             bool enable_parallel_restorecon)
         : uevent_listener_(uevent_listener),
           uevent_handlers_(uevent_handlers),
-          num_handler_subprocesses_(std::thread::hardware_concurrency() ?: 4) {}
+          num_handler_subprocesses_(std::thread::hardware_concurrency() ?: 4),
+          enable_parallel_restorecon_(enable_parallel_restorecon) {}
 
     void Run();
 
@@ -132,6 +134,8 @@ class ColdBoot {
     std::vector<std::unique_ptr<UeventHandler>>& uevent_handlers_;
 
     unsigned int num_handler_subprocesses_;
+    bool enable_parallel_restorecon_;
+
     std::vector<Uevent> uevent_queue_;
 
     std::set<pid_t> subprocess_pids_;

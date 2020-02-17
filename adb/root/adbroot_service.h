@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2007 The Android Open Source Project
+ * Copyright (C) 2019 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,25 +16,26 @@
 
 #pragma once
 
-#include <string>
-#include <vector>
-
-#include "devices.h"
+#include <android/adbroot/BnADBRootService.h>
+#include <binder/BinderService.h>
 
 namespace android {
-namespace init {
+namespace adbroot {
 
-struct UeventdConfiguration {
-    std::vector<Subsystem> subsystems;
-    std::vector<SysfsPermissions> sysfs_permissions;
-    std::vector<Permissions> dev_permissions;
-    std::vector<std::string> firmware_directories;
-    bool enable_modalias_handling = false;
-    size_t uevent_socket_rcvbuf_size = 0;
-    bool enable_parallel_restorecon = false;
+class ADBRootService : public BinderService<ADBRootService>, public BnADBRootService {
+  public:
+    ADBRootService();
+
+    static void Register();
+
+    binder::Status setEnabled(bool enabled) override;
+    binder::Status getEnabled(bool* _aidl_return) override;
+
+    static char const* getServiceName() { return "adbroot_service"; }
+  private:
+    bool enabled_;
+    Mutex lock_;
 };
 
-UeventdConfiguration ParseConfig(const std::vector<std::string>& configs);
-
-}  // namespace init
+}  // namespace adbroot
 }  // namespace android
