@@ -46,7 +46,7 @@ namespace android {
 namespace fs_mgr {
 namespace {
 
-const std::string kDefaultAndroidDtDir("/proc/device-tree/firmware/android");
+constexpr char kDefaultAndroidDtDir[] = "/proc/device-tree/firmware/android";
 
 struct FlagList {
     const char *name;
@@ -171,6 +171,18 @@ void ParseMountFlags(const std::string& flags, FstabEntry* entry) {
                 fs_options.append(",");  // appends a comma if not the first
             }
             fs_options.append(flag);
+
+            if (entry->fs_type == "f2fs" && StartsWith(flag, "reserve_root=")) {
+                std::string arg;
+                if (auto equal_sign = flag.find('='); equal_sign != std::string::npos) {
+                    arg = flag.substr(equal_sign + 1);
+                }
+                if (!ParseInt(arg, &entry->reserved_size)) {
+                    LWARNING << "Warning: reserve_root= flag malformed: " << arg;
+                } else {
+                    entry->reserved_size <<= 12;
+                }
+            }
         }
     }
     entry->fs_options = std::move(fs_options);
@@ -263,10 +275,6 @@ void ParseFsMgrFlags(const std::string& flags, FstabEntry* entry) {
                     LWARNING << "Warning: zramsize= flag malformed: " << arg;
                 }
             }
-        } else if (StartsWith(flag, "verify=")) {
-            // If the verify flag is followed by an = and the location for the verity state.
-            entry->fs_mgr_flags.verify = true;
-            entry->verity_loc = arg;
         } else if (StartsWith(flag, "forceencrypt=")) {
             // The forceencrypt flag is followed by an = and the location of the keys.
             entry->fs_mgr_flags.force_crypt = true;
@@ -697,13 +705,14 @@ bool ReadFstabFromDt(Fstab* fstab, bool log) {
     return true;
 }
 
-// For GSI to skip mounting /product and /product_services, until there are
-// well-defined interfaces between them and /system. Otherwise, the GSI flashed
-// on /system might not be able to work with /product and /product_services.
-// When they're skipped here, /system/product and /system/product_services in
-// GSI will be used.
+// For GSI to skip mounting /product and /system_ext, until there are well-defined interfaces
+// between them and /system. Otherwise, the GSI flashed on /system might not be able to work with
+// device-specific /product and /system_ext. skip_mount.cfg belongs to system_ext partition because
+// only common files for all targets can be put into system partition. It is under
+// /system/system_ext because GSI is a single system.img that includes the contents of system_ext
+// partition and product partition under /system/system_ext and /system/product, respectively.
 bool SkipMountingPartitions(Fstab* fstab) {
-    constexpr const char kSkipMountConfig[] = "/system/etc/init/config/skip_mount.cfg";
+    constexpr const char kSkipMountConfig[] = "/system/system_ext/etc/init/config/skip_mount.cfg";
 
     std::string skip_config;
     auto save_errno = errno;
@@ -720,6 +729,7 @@ bool SkipMountingPartitions(Fstab* fstab) {
                                  [&skip_mount_point](const auto& entry) {
                                      return entry.mount_point == skip_mount_point;
                                  });
+        if (it == fstab->end()) continue;
         fstab->erase(it, fstab->end());
         LOG(INFO) << "Skip mounting partition: " << skip_mount_point;
     }
@@ -809,8 +819,11 @@ FstabEntry BuildGsiSystemFstabEntry() {
 std::string GetVerityDeviceName(const FstabEntry& entry) {
     std::string base_device;
     if (entry.mount_point == "/") {
-        // In AVB, the dm device name is vroot instead of system.
-        base_device = entry.fs_mgr_flags.avb ? "vroot" : "system";
+        // When using system-as-root, the device name is fixed as "vroot".
+        if (entry.fs_mgr_flags.avb) {
+            return "vroot";
+        }
+        base_device = "system";
     } else {
         base_device = android::base::Basename(entry.mount_point);
     }

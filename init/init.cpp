@@ -28,16 +28,18 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <functional>
 #define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
 #include <sys/_system_properties.h>
-
 #include <map>
 #include <memory>
 #include <optional>
+#include <vector>
 
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
+#include <android-base/parseint.h>
 #include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
@@ -50,13 +52,11 @@
 #include <processgroup/setup.h>
 #include <selinux/android.h>
 
-#ifndef RECOVERY
-#include <binder/ProcessState.h>
-#endif
-
 #include "action_parser.h"
 #include "boringssl_self_test.h"
+#include "builtins.h"
 #include "epoll.h"
+#include "first_stage_init.h"
 #include "first_stage_mount.h"
 #include "import_parser.h"
 #include "keychords.h"
@@ -67,7 +67,10 @@
 #include "reboot.h"
 #include "reboot_utils.h"
 #include "security.h"
+#include "selabel.h"
 #include "selinux.h"
+#include "service.h"
+#include "service_parser.h"
 #include "sigchld_handler.h"
 #include "system/core/init/property_service.pb.h"
 #include "util.h"
@@ -90,8 +93,6 @@ static int property_triggers_enabled = 0;
 
 static char qemu[32];
 
-std::string default_console = "/dev/console";
-
 static int signal_fd = -1;
 static int property_fd = -1;
 
@@ -103,8 +104,6 @@ static std::string shutdown_command;
 static bool do_shutdown = false;
 static bool load_debug_prop = false;
 
-std::vector<std::string> late_import_paths;
-
 static std::vector<Subcontext>* subcontexts;
 
 void DumpState() {
@@ -115,7 +114,8 @@ void DumpState() {
 Parser CreateParser(ActionManager& action_manager, ServiceList& service_list) {
     Parser parser;
 
-    parser.AddSectionParser("service", std::make_unique<ServiceParser>(&service_list, subcontexts));
+    parser.AddSectionParser(
+            "service", std::make_unique<ServiceParser>(&service_list, subcontexts, std::nullopt));
     parser.AddSectionParser("on", std::make_unique<ActionParser>(&action_manager, subcontexts));
     parser.AddSectionParser("import", std::make_unique<ImportParser>(&parser));
 
@@ -126,7 +126,8 @@ Parser CreateParser(ActionManager& action_manager, ServiceList& service_list) {
 Parser CreateServiceOnlyParser(ServiceList& service_list) {
     Parser parser;
 
-    parser.AddSectionParser("service", std::make_unique<ServiceParser>(&service_list, subcontexts));
+    parser.AddSectionParser(
+            "service", std::make_unique<ServiceParser>(&service_list, subcontexts, std::nullopt));
     return parser;
 }
 
@@ -139,11 +140,11 @@ static void LoadBootScripts(ActionManager& action_manager, ServiceList& service_
         if (!parser.ParseConfig("/system/etc/init")) {
             late_import_paths.emplace_back("/system/etc/init");
         }
+        // late_import is available only in Q and earlier release. As we don't
+        // have system_ext in those versions, skip late_import for system_ext.
+        parser.ParseConfig("/system_ext/etc/init");
         if (!parser.ParseConfig("/product/etc/init")) {
             late_import_paths.emplace_back("/product/etc/init");
-        }
-        if (!parser.ParseConfig("/product_services/etc/init")) {
-            late_import_paths.emplace_back("/product_services/etc/init");
         }
         if (!parser.ParseConfig("/odm/etc/init")) {
             late_import_paths.emplace_back("/odm/etc/init");
@@ -201,6 +202,14 @@ void property_changed(const std::string& name, const std::string& value) {
 
     if (property_triggers_enabled) ActionManager::GetInstance().QueuePropertyChange(name, value);
 
+    // We always record how long init waited for ueventd to tell us cold boot finished.
+    // If we aren't waiting on this property, it means that ueventd finished before we even started
+    // to wait.
+    if (name == kColdBootDoneProp) {
+        auto time_waited = waiting_for_prop ? waiting_for_prop->duration().count() : 0;
+        property_set("ro.boottime.init.cold_boot_wait", std::to_string(time_waited));
+    }
+
     if (waiting_for_prop) {
         if (wait_prop_name == name && wait_prop_value == value) {
             LOG(INFO) << "Wait for property '" << wait_prop_name << "=" << wait_prop_value
@@ -240,18 +249,18 @@ static std::optional<boot_clock::time_point> HandleProcessActions() {
     return next_process_action_time;
 }
 
-static Result<Success> DoControlStart(Service* service) {
+static Result<void> DoControlStart(Service* service) {
     return service->Start();
 }
 
-static Result<Success> DoControlStop(Service* service) {
+static Result<void> DoControlStop(Service* service) {
     service->Stop();
-    return Success();
+    return {};
 }
 
-static Result<Success> DoControlRestart(Service* service) {
+static Result<void> DoControlRestart(Service* service) {
     service->Restart();
-    return Success();
+    return {};
 }
 
 enum class ControlTarget {
@@ -261,16 +270,16 @@ enum class ControlTarget {
 
 struct ControlMessageFunction {
     ControlTarget target;
-    std::function<Result<Success>(Service*)> action;
+    std::function<Result<void>(Service*)> action;
 };
 
 static const std::map<std::string, ControlMessageFunction>& get_control_message_map() {
     // clang-format off
     static const std::map<std::string, ControlMessageFunction> control_message_functions = {
         {"sigstop_on",        {ControlTarget::SERVICE,
-                               [](auto* service) { service->set_sigstop(true); return Success(); }}},
+                               [](auto* service) { service->set_sigstop(true); return Result<void>{}; }}},
         {"sigstop_off",       {ControlTarget::SERVICE,
-                               [](auto* service) { service->set_sigstop(false); return Success(); }}},
+                               [](auto* service) { service->set_sigstop(false); return Result<void>{}; }}},
         {"start",             {ControlTarget::SERVICE,   DoControlStart}},
         {"stop",              {ControlTarget::SERVICE,   DoControlStop}},
         {"restart",           {ControlTarget::SERVICE,   DoControlRestart}},
@@ -301,9 +310,6 @@ bool HandleControlMessage(const std::string& msg, const std::string& name, pid_t
         process_cmdline = "unknown process";
     }
 
-    LOG(INFO) << "Received control message '" << msg << "' for '" << name << "' from pid: " << pid
-              << " (" << process_cmdline << ")";
-
     const ControlMessageFunction& function = it->second;
 
     Service* svc = nullptr;
@@ -316,53 +322,34 @@ bool HandleControlMessage(const std::string& msg, const std::string& name, pid_t
             svc = ServiceList::GetInstance().FindInterface(name);
             break;
         default:
-            LOG(ERROR) << "Invalid function target from static map key '" << msg << "': "
+            LOG(ERROR) << "Invalid function target from static map key ctl." << msg << ": "
                        << static_cast<std::underlying_type<ControlTarget>::type>(function.target);
             return false;
     }
 
     if (svc == nullptr) {
-        LOG(ERROR) << "Could not find '" << name << "' for ctl." << msg;
+        LOG(ERROR) << "Control message: Could not find '" << name << "' for ctl." << msg
+                   << " from pid: " << pid << " (" << process_cmdline << ")";
         return false;
     }
 
     if (auto result = function.action(svc); !result) {
-        LOG(ERROR) << "Could not ctl." << msg << " for '" << name << "': " << result.error();
+        LOG(ERROR) << "Control message: Could not ctl." << msg << " for '" << name
+                   << "' from pid: " << pid << " (" << process_cmdline << "): " << result.error();
         return false;
     }
     return true;
 }
 
-static Result<Success> wait_for_coldboot_done_action(const BuiltinArguments& args) {
-    Timer t;
-
-    LOG(VERBOSE) << "Waiting for " COLDBOOT_DONE "...";
-
-    // Historically we had a 1s timeout here because we weren't otherwise
-    // tracking boot time, and many OEMs made their sepolicy regular
-    // expressions too expensive (http://b/19899875).
-
-    // Now we're tracking boot time, just log the time taken to a system
-    // property. We still panic if it takes more than a minute though,
-    // because any build that slow isn't likely to boot at all, and we'd
-    // rather any test lab devices fail back to the bootloader.
-    if (wait_for_file(COLDBOOT_DONE, 60s) < 0) {
-        LOG(FATAL) << "Timed out waiting for " COLDBOOT_DONE;
+static Result<void> wait_for_coldboot_done_action(const BuiltinArguments& args) {
+    if (!start_waiting_for_property(kColdBootDoneProp, "true")) {
+        LOG(FATAL) << "Could not wait for '" << kColdBootDoneProp << "'";
     }
 
-    property_set("ro.boottime.init.cold_boot_wait", std::to_string(t.duration().count()));
-    return Success();
+    return {};
 }
 
-static Result<Success> console_init_action(const BuiltinArguments& args) {
-    std::string console = GetProperty("ro.boot.console", "");
-    if (!console.empty()) {
-        default_console = "/dev/" + console;
-    }
-    return Success();
-}
-
-static Result<Success> SetupCgroupsAction(const BuiltinArguments&) {
+static Result<void> SetupCgroupsAction(const BuiltinArguments&) {
     // Have to create <CGROUPS_RC_DIR> using make_dir function
     // for appropriate sepolicy to be set for it
     make_dir(android::base::Dirname(CGROUPS_RC_PATH), 0711);
@@ -370,7 +357,7 @@ static Result<Success> SetupCgroupsAction(const BuiltinArguments&) {
         return ErrnoError() << "Failed to setup cgroups";
     }
 
-    return Success();
+    return {};
 }
 
 static void import_kernel_nv(const std::string& key, const std::string& value, bool for_emulator) {
@@ -454,34 +441,16 @@ static void process_kernel_cmdline() {
     if (qemu[0]) import_kernel_cmdline(true, import_kernel_nv);
 }
 
-static Result<Success> property_enable_triggers_action(const BuiltinArguments& args) {
+static Result<void> property_enable_triggers_action(const BuiltinArguments& args) {
     /* Enable property triggers. */
     property_triggers_enabled = 1;
-    return Success();
+    return {};
 }
 
-static Result<Success> queue_property_triggers_action(const BuiltinArguments& args) {
+static Result<void> queue_property_triggers_action(const BuiltinArguments& args) {
     ActionManager::GetInstance().QueueBuiltinAction(property_enable_triggers_action, "enable_property_trigger");
     ActionManager::GetInstance().QueueAllPropertyActions();
-    return Success();
-}
-
-static Result<Success> InitBinder(const BuiltinArguments& args) {
-    // init's use of binder is very limited. init cannot:
-    //   - have any binder threads
-    //   - receive incoming binder calls
-    //   - pass local binder services to remote processes
-    //   - use death recipients
-    // The main supported usecases are:
-    //   - notifying other daemons (oneway calls only)
-    //   - retrieving data that is necessary to boot
-    // Also, binder can't be used by recovery.
-#ifndef RECOVERY
-    android::ProcessState::self()->setThreadPoolMaxThreadCount(0);
-    android::ProcessState::self()->setCallRestriction(
-            ProcessState::CallRestriction::ERROR_IF_NOT_ONEWAY);
-#endif
-    return Success();
+    return {};
 }
 
 // Set the UDC controller for the ConfigFS USB Gadgets.
@@ -623,64 +592,37 @@ static void UmountDebugRamdisk() {
     }
 }
 
-void SendLoadPersistentPropertiesMessage() {
-    auto init_message = InitMessage{};
-    init_message.set_load_persistent_properties(true);
-    if (auto result = SendMessage(property_fd, init_message); !result) {
-        LOG(ERROR) << "Failed to send load persistent properties message: " << result.error();
+static void RecordStageBoottimes(const boot_clock::time_point& second_stage_start_time) {
+    int64_t first_stage_start_time_ns = -1;
+    if (auto first_stage_start_time_str = getenv(kEnvFirstStageStartedAt);
+        first_stage_start_time_str) {
+        property_set("ro.boottime.init", first_stage_start_time_str);
+        android::base::ParseInt(first_stage_start_time_str, &first_stage_start_time_ns);
     }
-}
+    unsetenv(kEnvFirstStageStartedAt);
 
-void SendStopSendingMessagesMessage() {
-    auto init_message = InitMessage{};
-    init_message.set_stop_sending_messages(true);
-    if (auto result = SendMessage(property_fd, init_message); !result) {
-        LOG(ERROR) << "Failed to send load persistent properties message: " << result.error();
+    int64_t selinux_start_time_ns = -1;
+    if (auto selinux_start_time_str = getenv(kEnvSelinuxStartedAt); selinux_start_time_str) {
+        android::base::ParseInt(selinux_start_time_str, &selinux_start_time_ns);
     }
-}
+    unsetenv(kEnvSelinuxStartedAt);
 
-static void HandlePropertyFd() {
-    auto message = ReadMessage(property_fd);
-    if (!message) {
-        LOG(ERROR) << "Could not read message from property service: " << message.error();
-        return;
-    }
+    if (selinux_start_time_ns == -1) return;
+    if (first_stage_start_time_ns == -1) return;
 
-    auto property_message = PropertyMessage{};
-    if (!property_message.ParseFromString(*message)) {
-        LOG(ERROR) << "Could not parse message from property service";
-        return;
-    }
-
-    switch (property_message.msg_case()) {
-        case PropertyMessage::kControlMessage: {
-            auto& control_message = property_message.control_message();
-            bool success = HandleControlMessage(control_message.msg(), control_message.name(),
-                                                control_message.pid());
-
-            uint32_t response = success ? PROP_SUCCESS : PROP_ERROR_HANDLE_CONTROL_MESSAGE;
-            if (control_message.has_fd()) {
-                int fd = control_message.fd();
-                TEMP_FAILURE_RETRY(send(fd, &response, sizeof(response), 0));
-                close(fd);
-            }
-            break;
-        }
-        case PropertyMessage::kChangedMessage: {
-            auto& changed_message = property_message.changed_message();
-            property_changed(changed_message.name(), changed_message.value());
-            break;
-        }
-        default:
-            LOG(ERROR) << "Unknown message type from property service: "
-                       << property_message.msg_case();
-    }
+    property_set("ro.boottime.init.first_stage",
+                 std::to_string(selinux_start_time_ns - first_stage_start_time_ns));
+    property_set("ro.boottime.init.selinux",
+                 std::to_string(second_stage_start_time.time_since_epoch().count() -
+                                selinux_start_time_ns));
 }
 
 int SecondStageMain(int argc, char** argv) {
     if (REBOOT_BOOTLOADER_ON_PANIC) {
         InstallRebootSignalHandlers();
     }
+
+    boot_clock::time_point start_time = boot_clock::now();
 
     SetStdioToDevNull(argv);
     InitKernelLogging(argv);
@@ -713,9 +655,8 @@ int SecondStageMain(int argc, char** argv) {
     // used by init as well as the current required properties.
     export_kernel_boot_props();
 
-    // Make the time that init started available for bootstat to log.
-    property_set("ro.boottime.init", getenv("INIT_STARTED_AT"));
-    property_set("ro.boottime.init.selinux", getenv("INIT_SELINUX_TOOK"));
+    // Make the time that init stages started available for bootstat to log.
+    RecordStageBoottimes(start_time);
 
     // Set libavb version for Framework-only OTA match in Treble build.
     const char* avb_version = getenv("INIT_AVB_VERSION");
@@ -728,8 +669,6 @@ int SecondStageMain(int argc, char** argv) {
     }
 
     // Clean up our environment.
-    unsetenv("INIT_STARTED_AT");
-    unsetenv("INIT_SELINUX_TOOK");
     unsetenv("INIT_AVB_VERSION");
     unsetenv("INIT_FORCE_DEBUGGABLE");
 
@@ -758,7 +697,7 @@ int SecondStageMain(int argc, char** argv) {
     MountHandler mount_handler(&epoll);
     set_usb_controller();
 
-    const BuiltinFunctionMap function_map;
+    const BuiltinFunctionMap& function_map = GetBuiltinFunctionMap();
     Action::set_function_map(&function_map);
 
     if (!SetupMountNamespaces()) {
@@ -785,6 +724,7 @@ int SecondStageMain(int argc, char** argv) {
 
     am.QueueBuiltinAction(SetupCgroupsAction, "SetupCgroups");
 
+    am.QueueBuiltinAction(SetKptrRestrictAction, "SetKptrRestrict");
     am.QueueEventTrigger("early-init");
 
     // Queue an action that waits for coldboot done so we know ueventd has set up all of /dev...
@@ -792,18 +732,16 @@ int SecondStageMain(int argc, char** argv) {
     // ... so that we can start queuing up actions that require stuff from /dev.
     am.QueueBuiltinAction(MixHwrngIntoLinuxRngAction, "MixHwrngIntoLinuxRng");
     am.QueueBuiltinAction(SetMmapRndBitsAction, "SetMmapRndBits");
-    am.QueueBuiltinAction(SetKptrRestrictAction, "SetKptrRestrict");
     Keychords keychords;
     am.QueueBuiltinAction(
-        [&epoll, &keychords](const BuiltinArguments& args) -> Result<Success> {
-            for (const auto& svc : ServiceList::GetInstance()) {
-                keychords.Register(svc->keycodes());
-            }
-            keychords.Start(&epoll, HandleKeychord);
-            return Success();
-        },
-        "KeychordInit");
-    am.QueueBuiltinAction(console_init_action, "console_init");
+            [&epoll, &keychords](const BuiltinArguments& args) -> Result<void> {
+                for (const auto& svc : ServiceList::GetInstance()) {
+                    keychords.Register(svc->keycodes());
+                }
+                keychords.Start(&epoll, HandleKeychord);
+                return {};
+            },
+            "KeychordInit");
 
     // Trigger all the boot actions to get us started.
     am.QueueEventTrigger("init");
@@ -814,9 +752,6 @@ int SecondStageMain(int argc, char** argv) {
     // Repeat mix_hwrng_into_linux_rng in case /dev/hw_random or /dev/random
     // wasn't ready immediately after wait_for_coldboot_done
     am.QueueBuiltinAction(MixHwrngIntoLinuxRngAction, "MixHwrngIntoLinuxRng");
-
-    // Initialize binder before bringing up other system services
-    am.QueueBuiltinAction(InitBinder, "InitBinder");
 
     // Don't mount filesystems or start core system services in charger mode.
     std::string bootmode = GetProperty("ro.bootmode", "");
@@ -859,8 +794,17 @@ int SecondStageMain(int argc, char** argv) {
             if (am.HasMoreCommands()) epoll_timeout = 0ms;
         }
 
-        if (auto result = epoll.Wait(epoll_timeout); !result) {
-            LOG(ERROR) << result.error();
+        auto pending_functions = epoll.Wait(epoll_timeout);
+        if (!pending_functions) {
+            LOG(ERROR) << pending_functions.error();
+        } else if (!pending_functions->empty()) {
+            // We always reap children before responding to the other pending functions. This is to
+            // prevent a race where other daemons see that a service has exited and ask init to
+            // start it again via ctl.start before init has reaped it.
+            ReapAnyOutstandingChildren();
+            for (const auto& function : *pending_functions) {
+                (*function)();
+            }
         }
     }
 

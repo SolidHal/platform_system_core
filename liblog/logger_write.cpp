@@ -29,7 +29,6 @@
 #include <private/android_filesystem_config.h>
 #include <private/android_logger.h>
 
-#include "config_read.h" /* __android_log_config_read_close() definition */
 #include "config_write.h"
 #include "log_portability.h"
 #include "logger.h"
@@ -407,56 +406,7 @@ int __android_log_write(int prio, const char* tag, const char* msg) {
 }
 
 int __android_log_buf_write(int bufID, int prio, const char* tag, const char* msg) {
-  struct iovec vec[3];
-  char tmp_tag[32];
-
   if (!tag) tag = "";
-
-  /* XXX: This needs to go! */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wstring-plus-int"
-  if (bufID != LOG_ID_RADIO) {
-    switch (tag[0]) {
-      case 'H':
-        if (strcmp(tag + 1, "HTC_RIL" + 1)) break;
-        goto inform;
-      case 'R':
-        /* Any log tag with "RIL" as the prefix */
-        if (strncmp(tag + 1, "RIL" + 1, strlen("RIL") - 1)) break;
-        goto inform;
-      case 'Q':
-        /* Any log tag with "QC_RIL" as the prefix */
-        if (strncmp(tag + 1, "QC_RIL" + 1, strlen("QC_RIL") - 1)) break;
-        goto inform;
-      case 'I':
-        /* Any log tag with "IMS" as the prefix */
-        if (strncmp(tag + 1, "IMS" + 1, strlen("IMS") - 1)) break;
-        goto inform;
-      case 'A':
-        if (strcmp(tag + 1, "AT" + 1)) break;
-        goto inform;
-      case 'G':
-        if (strcmp(tag + 1, "GSM" + 1)) break;
-        goto inform;
-      case 'S':
-        if (strcmp(tag + 1, "STK" + 1) && strcmp(tag + 1, "SMS" + 1)) break;
-        goto inform;
-      case 'C':
-        if (strcmp(tag + 1, "CDMA" + 1)) break;
-        goto inform;
-      case 'P':
-        if (strcmp(tag + 1, "PHONE" + 1)) break;
-      /* FALLTHRU */
-      inform:
-        bufID = LOG_ID_RADIO;
-        snprintf(tmp_tag, sizeof(tmp_tag), "use-Rlog/RLOG-%s", tag);
-        tag = tmp_tag;
-        [[fallthrough]];
-      default:
-        break;
-    }
-  }
-#pragma clang diagnostic pop
 
 #if __BIONIC__
   if (prio == ANDROID_LOG_FATAL) {
@@ -464,6 +414,7 @@ int __android_log_buf_write(int bufID, int prio, const char* tag, const char* ms
   }
 #endif
 
+  struct iovec vec[3];
   vec[0].iov_base = (unsigned char*)&prio;
   vec[0].iov_len = 1;
   vec[1].iov_base = (void*)tag;
@@ -672,7 +623,6 @@ int android_set_log_transport(int transport_flag) {
   if (__android_log_transport != transport_flag) {
     __android_log_transport = transport_flag;
     __android_log_config_write_close();
-    __android_log_config_read_close();
 
     write_to_log = __write_to_log_init;
     /* generically we only expect these two values for write_to_log */

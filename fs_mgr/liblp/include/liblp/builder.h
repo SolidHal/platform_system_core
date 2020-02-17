@@ -24,6 +24,7 @@
 #include <memory>
 #include <optional>
 #include <set>
+#include <string_view>
 
 #include "liblp.h"
 #include "partition_opener.h"
@@ -36,6 +37,9 @@ class LinearExtent;
 // By default, partitions are aligned on a 1MiB boundary.
 static const uint32_t kDefaultPartitionAlignment = 1024 * 1024;
 static const uint32_t kDefaultBlockSize = 4096;
+
+// Name of the default group in a metadata.
+static constexpr std::string_view kDefaultGroup = "default";
 
 // Abstraction around dm-targets that can be encoded into logical partition tables.
 class Extent {
@@ -87,7 +91,7 @@ class PartitionGroup final {
     friend class MetadataBuilder;
 
   public:
-    explicit PartitionGroup(const std::string& name, uint64_t maximum_size)
+    explicit PartitionGroup(std::string_view name, uint64_t maximum_size)
         : name_(name), maximum_size_(maximum_size) {}
 
     const std::string& name() const { return name_; }
@@ -104,7 +108,7 @@ class Partition final {
     friend class MetadataBuilder;
 
   public:
-    Partition(const std::string& name, const std::string& group_name, uint32_t attributes);
+    Partition(std::string_view name, std::string_view group_name, uint32_t attributes);
 
     // Add a raw extent.
     void AddExtent(std::unique_ptr<Extent>&& extent);
@@ -119,18 +123,46 @@ class Partition final {
     const std::string& name() const { return name_; }
     const std::string& group_name() const { return group_name_; }
     uint32_t attributes() const { return attributes_; }
+    void set_attributes(uint32_t attributes) { attributes_ = attributes; }
     const std::vector<std::unique_ptr<Extent>>& extents() const { return extents_; }
     uint64_t size() const { return size_; }
 
   private:
     void ShrinkTo(uint64_t aligned_size);
-    void set_group_name(const std::string& group_name) { group_name_ = group_name; }
+    void set_group_name(std::string_view group_name) { group_name_ = group_name; }
 
     std::string name_;
     std::string group_name_;
     std::vector<std::unique_ptr<Extent>> extents_;
     uint32_t attributes_;
     uint64_t size_;
+};
+
+// An interval in the metadata. This is similar to a LinearExtent with one difference.
+// LinearExtent represents a "used" region in the metadata, while Interval can also represent
+// an "unused" region.
+struct Interval {
+    uint32_t device_index;
+    uint64_t start;
+    uint64_t end;
+
+    Interval(uint32_t device_index, uint64_t start, uint64_t end)
+        : device_index(device_index), start(start), end(end) {}
+    uint64_t length() const { return end - start; }
+
+    // Note: the device index is not included in sorting (intervals are
+    // sorted in per-device lists).
+    bool operator<(const Interval& other) const {
+        return (start == other.start) ? end < other.end : start < other.start;
+    }
+
+    // Intersect |a| with |b|.
+    // If no intersection, result has 0 length().
+    static Interval Intersect(const Interval& a, const Interval& b);
+
+    // Intersect two lists of intervals, and store result to |a|.
+    static std::vector<Interval> Intersect(const std::vector<Interval>& a,
+                                           const std::vector<Interval>& b);
 };
 
 class MetadataBuilder {
@@ -196,15 +228,12 @@ class MetadataBuilder {
         return New(device_info, metadata_max_size, metadata_slot_count);
     }
 
-    // Used by the test harness to override whether the device is "A/B".
-    static void OverrideABForTesting(bool ab_device);
-
     // Define a new partition group. By default there is one group called
     // "default", with an unrestricted size. A non-zero size will restrict the
     // total space used by all partitions in the group.
     //
     // This can fail and return false if the group already exists.
-    bool AddGroup(const std::string& group_name, uint64_t maximum_size);
+    bool AddGroup(std::string_view group_name, uint64_t maximum_size);
 
     // Export metadata so it can be serialized to an image, to disk, or mounted
     // via device-mapper.
@@ -212,7 +241,7 @@ class MetadataBuilder {
 
     // Add a partition, returning a handle so it can be sized as needed. If a
     // partition with the given name already exists, nullptr is returned.
-    Partition* AddPartition(const std::string& name, const std::string& group_name,
+    Partition* AddPartition(std::string_view name, std::string_view group_name,
                             uint32_t attributes);
 
     // Same as AddPartition above, but uses the default partition group which
@@ -223,10 +252,10 @@ class MetadataBuilder {
     void RemovePartition(const std::string& name);
 
     // Find a partition by name. If no partition is found, nullptr is returned.
-    Partition* FindPartition(const std::string& name);
+    Partition* FindPartition(std::string_view name);
 
     // Find a group by name. If no group is found, nullptr is returned.
-    PartitionGroup* FindGroup(const std::string& name);
+    PartitionGroup* FindGroup(std::string_view name);
 
     // Add a predetermined extent to a partition.
     bool AddLinearExtent(Partition* partition, const std::string& block_device,
@@ -242,7 +271,11 @@ class MetadataBuilder {
     //
     // Note, this is an in-memory operation, and it does not alter the
     // underlying filesystem or contents of the partition on disk.
-    bool ResizePartition(Partition* partition, uint64_t requested_size);
+    //
+    // If |free_region_hint| is not empty, it will only try to allocate extents
+    // in regions within the list.
+    bool ResizePartition(Partition* partition, uint64_t requested_size,
+                         const std::vector<Interval>& free_region_hint = {});
 
     // Return the list of partitions belonging to a group.
     std::vector<Partition*> ListPartitionsInGroup(const std::string& group_name);
@@ -251,7 +284,7 @@ class MetadataBuilder {
     // the metadata is exported, to avoid errors during potential group and
     // size shuffling operations. This will return false if the new group does
     // not exist.
-    bool ChangePartitionGroup(Partition* partition, const std::string& group_name);
+    bool ChangePartitionGroup(Partition* partition, std::string_view group_name);
 
     // Changes the size of a partition group. Size constraints will not be
     // checked until metadata is exported, to avoid errors during group
@@ -267,7 +300,7 @@ class MetadataBuilder {
     std::vector<std::string> ListGroups() const;
 
     // Remove all partitions belonging to a group, then remove the group.
-    void RemoveGroupAndPartitions(const std::string& group_name);
+    void RemoveGroupAndPartitions(std::string_view group_name);
 
     // Set the LP_METADATA_AUTO_SLOT_SUFFIXING flag.
     void SetAutoSlotSuffixing();
@@ -286,6 +319,12 @@ class MetadataBuilder {
     // Return true if a block device is found, else false.
     bool HasBlockDevice(const std::string& partition_name) const;
 
+    // Return the name of the block device at |index|.
+    std::string GetBlockDevicePartitionName(uint64_t index) const;
+
+    // Return the list of free regions not occupied by extents in the metadata.
+    std::vector<Interval> GetFreeRegions() const;
+
   private:
     MetadataBuilder();
     MetadataBuilder(const MetadataBuilder&) = delete;
@@ -295,7 +334,8 @@ class MetadataBuilder {
     bool Init(const std::vector<BlockDeviceInfo>& block_devices, const std::string& super_partition,
               uint32_t metadata_max_size, uint32_t metadata_slot_count);
     bool Init(const LpMetadata& metadata);
-    bool GrowPartition(Partition* partition, uint64_t aligned_size);
+    bool GrowPartition(Partition* partition, uint64_t aligned_size,
+                       const std::vector<Interval>& free_region_hint);
     void ShrinkPartition(Partition* partition, uint64_t aligned_size);
     uint64_t AlignSector(const LpMetadataBlockDevice& device, uint64_t sector) const;
     uint64_t TotalSizeOfGroup(PartitionGroup* group) const;
@@ -306,26 +346,18 @@ class MetadataBuilder {
     void ImportExtents(Partition* dest, const LpMetadata& metadata,
                        const LpMetadataPartition& source);
     bool ImportPartition(const LpMetadata& metadata, const LpMetadataPartition& source);
-    bool IsABDevice() const;
-    bool IsRetrofitDevice() const;
+
+    // Return true if the device is an AB device.
+    static bool IsABDevice();
+
+    // Return true if the device is retrofitting dynamic partitions.
+    static bool IsRetrofitDynamicPartitionsDevice();
+
+    // Return true if _b partitions should be prioritized at the second half of the device.
+    bool ShouldHalveSuper() const;
+
     bool ValidatePartitionGroups() const;
 
-    struct Interval {
-        uint32_t device_index;
-        uint64_t start;
-        uint64_t end;
-
-        Interval(uint32_t device_index, uint64_t start, uint64_t end)
-            : device_index(device_index), start(start), end(end) {}
-        uint64_t length() const { return end - start; }
-
-        // Note: the device index is not included in sorting (intervals are
-        // sorted in per-device lists).
-        bool operator<(const Interval& other) const {
-            return (start == other.start) ? end < other.end : start < other.start;
-        }
-    };
-    std::vector<Interval> GetFreeRegions() const;
     bool IsAnyRegionCovered(const std::vector<Interval>& regions,
                             const LinearExtent& candidate) const;
     bool IsAnyRegionAllocated(const LinearExtent& candidate) const;
@@ -336,8 +368,8 @@ class MetadataBuilder {
                                                     const std::vector<Interval>& free_list,
                                                     uint64_t sectors_needed) const;
 
-    static bool sABOverrideValue;
-    static bool sABOverrideSet;
+    static bool UpdateMetadataForOtherSuper(LpMetadata* metadata, uint32_t source_slot_number,
+                                            uint32_t target_slot_number);
 
     LpMetadataGeometry geometry_;
     LpMetadataHeader header_;
@@ -345,7 +377,6 @@ class MetadataBuilder {
     std::vector<std::unique_ptr<PartitionGroup>> groups_;
     std::vector<LpMetadataBlockDevice> block_devices_;
     bool auto_slot_suffixing_;
-    bool ignore_slot_suffixing_;
 };
 
 // Read BlockDeviceInfo for a given block device. This always returns false

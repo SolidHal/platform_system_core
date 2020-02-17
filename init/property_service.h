@@ -14,8 +14,7 @@
  * limitations under the License.
  */
 
-#ifndef _INIT_PROPERTY_H
-#define _INIT_PROPERTY_H
+#pragma once
 
 #include <sys/socket.h>
 
@@ -32,11 +31,13 @@ bool CanReadProperty(const std::string& source_context, const std::string& name)
 
 extern uint32_t (*property_set)(const std::string& name, const std::string& value);
 
+uint32_t HandlePropertySet(const std::string& name, const std::string& value,
+                           const std::string& source_context, const ucred& cr, std::string* error);
+
 void property_init();
 void property_load_boot_defaults(bool load_debug_prop);
-void StartPropertyService(int* epoll_socket);
+void load_persist_props();
+void StartPropertyService(Epoll* epoll);
 
 }  // namespace init
 }  // namespace android
-
-#endif  /* _INIT_PROPERTY_H */

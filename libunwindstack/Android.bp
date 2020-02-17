@@ -125,10 +125,6 @@ cc_library {
         },
     },
 
-    whole_static_libs: [
-        "libdemangle"
-    ],
-
     static_libs: [
         "libprocinfo",
     ],
@@ -157,10 +153,11 @@ cc_test_library {
     shared_libs: [
         "libunwindstack",
     ],
+    relative_install_path: "libunwindstack_test",
 }
 
-cc_test {
-    name: "libunwindstack_test",
+cc_defaults {
+    name: "libunwindstack_testlib_flags",
     defaults: ["libunwindstack_flags"],
 
     srcs: [
@@ -184,8 +181,8 @@ cc_test {
         "tests/ElfInterfaceTest.cpp",
         "tests/ElfTest.cpp",
         "tests/ElfTestUtils.cpp",
+        "tests/IsolatedSettings.cpp",
         "tests/JitDebugTest.cpp",
-        "tests/LocalUnwinderTest.cpp",
         "tests/LogFake.cpp",
         "tests/MapInfoCreateMemoryTest.cpp",
         "tests/MapInfoGetBuildIDTest.cpp",
@@ -213,6 +210,7 @@ cc_test {
         "tests/UnwindOfflineTest.cpp",
         "tests/UnwindTest.cpp",
         "tests/UnwinderTest.cpp",
+        "tests/VerifyBionicTerminationTest.cpp",
     ],
 
     cflags: [
@@ -241,10 +239,12 @@ cc_test {
         "tests/files/offline/debug_frame_first_x86/*",
         "tests/files/offline/debug_frame_load_bias_arm/*",
         "tests/files/offline/eh_frame_hdr_begin_x86_64/*",
+        "tests/files/offline/invalid_elf_offset_arm/*",
         "tests/files/offline/jit_debug_arm/*",
         "tests/files/offline/jit_debug_x86/*",
         "tests/files/offline/jit_map_arm/*",
         "tests/files/offline/gnu_debugdata_arm/*",
+        "tests/files/offline/load_bias_ro_rx_x86_64/*",
         "tests/files/offline/offset_arm/*",
         "tests/files/offline/shared_lib_in_apk_arm64/*",
         "tests/files/offline/shared_lib_in_apk_memory_only_arm64/*",
@@ -252,9 +252,26 @@ cc_test {
         "tests/files/offline/straddle_arm/*",
         "tests/files/offline/straddle_arm64/*",
     ],
+}
+
+cc_test {
+    name: "libunwindstack_test",
+    defaults: ["libunwindstack_testlib_flags"],
+    isolated: true,
+
+    srcs: [
+        "tests/LocalUnwinderTest.cpp",
+    ],
     required: [
         "libunwindstack_local",
     ],
+}
+
+// Skip LocalUnwinderTest until atest understands required properly.
+cc_test {
+    name: "libunwindstack_unit_test",
+    defaults: ["libunwindstack_testlib_flags"],
+    isolated: true,
 }
 
 //-------------------------------------------------------------------------

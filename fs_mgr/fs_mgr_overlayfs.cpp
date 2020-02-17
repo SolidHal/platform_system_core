@@ -43,6 +43,7 @@
 #include <android-base/unique_fd.h>
 #include <ext4_utils/ext4_utils.h>
 #include <fs_mgr.h>
+#include <fs_mgr/file_wait.h>
 #include <fs_mgr_dm_linear.h>
 #include <fs_mgr_overlayfs.h>
 #include <fstab/fstab.h>
@@ -132,7 +133,7 @@ bool fs_mgr_dir_is_writable(const std::string& path) {
     return ret | !rmdir(test_directory.c_str());
 }
 
-// At less than 1% free space return value of false,
+// At less than 1% or 8MB of free space return value of false,
 // means we will try to wrap with overlayfs.
 bool fs_mgr_filesystem_has_space(const std::string& mount_point) {
     // If we have access issues to find out space remaining, return true
@@ -144,9 +145,36 @@ bool fs_mgr_filesystem_has_space(const std::string& mount_point) {
         return true;
     }
 
-    static constexpr int kPercentThreshold = 1;  // 1%
+    static constexpr int kPercentThreshold = 1;                       // 1%
+    static constexpr unsigned long kSizeThreshold = 8 * 1024 * 1024;  // 8MB
 
-    return (vst.f_bfree >= (vst.f_blocks * kPercentThreshold / 100));
+    return (vst.f_bfree >= (vst.f_blocks * kPercentThreshold / 100)) &&
+           (vst.f_bfree * vst.f_bsize) >= kSizeThreshold;
+}
+
+const auto kPhysicalDevice = "/dev/block/by-name/"s;
+
+bool fs_mgr_update_blk_device(FstabEntry* entry) {
+    if (entry->fs_mgr_flags.logical) {
+        fs_mgr_update_logical_partition(entry);
+    }
+    if (fs_mgr_access(entry->blk_device)) {
+        return true;
+    }
+    if (entry->blk_device != "/dev/root") {
+        return false;
+    }
+
+    // special case for system-as-root (taimen and others)
+    auto blk_device = kPhysicalDevice + "system";
+    if (!fs_mgr_access(blk_device)) {
+        blk_device += fs_mgr_get_slot_suffix();
+        if (!fs_mgr_access(blk_device)) {
+            return false;
+        }
+    }
+    entry->blk_device = blk_device;
+    return true;
 }
 
 bool fs_mgr_overlayfs_enabled(FstabEntry* entry) {
@@ -156,18 +184,18 @@ bool fs_mgr_overlayfs_enabled(FstabEntry* entry) {
     if (!fs_mgr_filesystem_has_space(entry->mount_point)) {
         return true;
     }
-    if (entry->fs_mgr_flags.logical) {
-        fs_mgr_update_logical_partition(entry);
+
+    // blk_device needs to be setup so we can check superblock.
+    // If we fail here, because during init first stage and have doubts.
+    if (!fs_mgr_update_blk_device(entry)) {
+        return true;
     }
+
+    // check if ext4 de-dupe
     auto save_errno = errno;
-    errno = 0;
     auto has_shared_blocks = fs_mgr_has_shared_blocks(entry->mount_point, entry->blk_device);
     if (!has_shared_blocks && (entry->mount_point == "/system")) {
         has_shared_blocks = fs_mgr_has_shared_blocks("/", entry->blk_device);
-    }
-    // special case for first stage init for system as root (taimen)
-    if (!has_shared_blocks && (errno == ENOENT) && (entry->blk_device == "/dev/root")) {
-        has_shared_blocks = true;
     }
     errno = save_errno;
     return has_shared_blocks;
@@ -387,8 +415,6 @@ uint32_t fs_mgr_overlayfs_slot_number() {
     return SlotNumberForSlotSuffix(fs_mgr_get_slot_suffix());
 }
 
-const auto kPhysicalDevice = "/dev/block/by-name/"s;
-
 std::string fs_mgr_overlayfs_super_device(uint32_t slot_number) {
     return kPhysicalDevice + fs_mgr_get_super_partition_name(slot_number);
 }
@@ -443,7 +469,7 @@ bool fs_mgr_overlayfs_teardown_scratch(const std::string& overlay, bool* change)
     auto metadata = builder->Export();
     if (metadata && UpdatePartitionTable(super_device, *metadata.get(), slot_number)) {
         if (change) *change = true;
-        if (!DestroyLogicalPartition(partition_name, 0s)) return false;
+        if (!DestroyLogicalPartition(partition_name)) return false;
     } else {
         LERROR << "delete partition " << overlay;
         return false;
@@ -687,7 +713,7 @@ bool fs_mgr_overlayfs_mount(const std::string& mount_point) {
     }
     report = report + ")=";
 
-    auto ret = mount("overlay", mount_point.c_str(), "overlay", MS_RDONLY | MS_RELATIME,
+    auto ret = mount("overlay", mount_point.c_str(), "overlay", MS_RDONLY | MS_NOATIME,
                      options.c_str());
     if (ret) {
         retval = false;
@@ -750,7 +776,7 @@ bool fs_mgr_overlayfs_mount_scratch(const std::string& device_path, const std::s
     entry.fs_type = mnt_type;
     if ((mnt_type == "f2fs") && !f2fs) entry.fs_type = "ext4";
     if ((mnt_type == "ext4") && !ext4) entry.fs_type = "f2fs";
-    entry.flags = MS_RELATIME;
+    entry.flags = MS_NOATIME;
     if (readonly) {
         entry.flags |= MS_RDONLY;
     } else {
@@ -833,6 +859,25 @@ bool fs_mgr_overlayfs_make_scratch(const std::string& scratch_device, const std:
     return true;
 }
 
+static void TruncatePartitionsWithSuffix(MetadataBuilder* builder, const std::string& suffix) {
+    auto& dm = DeviceMapper::Instance();
+
+    // Remove <other> partitions
+    for (const auto& group : builder->ListGroups()) {
+        for (const auto& part : builder->ListPartitionsInGroup(group)) {
+            const auto& name = part->name();
+            if (!android::base::EndsWith(name, suffix)) {
+                continue;
+            }
+            if (dm.GetState(name) != DmDeviceState::INVALID && !DestroyLogicalPartition(name)) {
+                continue;
+            }
+            builder->ResizePartition(builder->FindPartition(name), 0);
+        }
+    }
+}
+
+// This is where we find and steal backing storage from the system.
 bool fs_mgr_overlayfs_create_scratch(const Fstab& fstab, std::string* scratch_device,
                                      bool* partition_exists, bool* change) {
     *scratch_device = fs_mgr_overlayfs_scratch_device();
@@ -879,17 +924,26 @@ bool fs_mgr_overlayfs_create_scratch(const Fstab& fstab, std::string* scratch_de
             // the adb remount overrides :-( .
             auto margin_size = uint64_t(3 * 256 * 1024);
             BlockDeviceInfo info;
-            if (builder->GetBlockDeviceInfo(partition_name, &info)) {
+            if (builder->GetBlockDeviceInfo(fs_mgr_get_super_partition_name(slot_number), &info)) {
                 margin_size = 3 * info.logical_block_size;
             }
             partition_size = std::max(std::min(kMinimumSize, partition_size - margin_size),
                                       partition_size / 2);
             if (partition_size > partition->size()) {
                 if (!builder->ResizePartition(partition, partition_size)) {
-                    LERROR << "resize " << partition_name;
-                    return false;
+                    // Try to free up space by deallocating partitions in the other slot.
+                    TruncatePartitionsWithSuffix(builder.get(), fs_mgr_get_other_slot_suffix());
+
+                    partition_size =
+                            builder->AllocatableSpace() - builder->UsedSpace() + partition->size();
+                    partition_size = std::max(std::min(kMinimumSize, partition_size - margin_size),
+                                              partition_size / 2);
+                    if (!builder->ResizePartition(partition, partition_size)) {
+                        LERROR << "resize " << partition_name;
+                        return false;
+                    }
                 }
-                if (!partition_create) DestroyLogicalPartition(partition_name, 10s);
+                if (!partition_create) DestroyLogicalPartition(partition_name);
                 changed = true;
                 *partition_exists = false;
             }
@@ -907,9 +961,16 @@ bool fs_mgr_overlayfs_create_scratch(const Fstab& fstab, std::string* scratch_de
     }
 
     if (changed || partition_create) {
-        if (!CreateLogicalPartition(super_device, slot_number, partition_name, true, 10s,
-                                    scratch_device))
+        CreateLogicalPartitionParams params = {
+                .block_device = super_device,
+                .metadata_slot = slot_number,
+                .partition_name = partition_name,
+                .force_writable = true,
+                .timeout_ms = 10s,
+        };
+        if (!CreateLogicalPartition(params, scratch_device)) {
             return false;
+        }
 
         if (change) *change = true;
     }
@@ -1020,7 +1081,7 @@ bool fs_mgr_overlayfs_mount_all(Fstab* fstab) {
             scratch_can_be_mounted = false;
             auto scratch_device = fs_mgr_overlayfs_scratch_device();
             if (fs_mgr_overlayfs_scratch_can_be_mounted(scratch_device) &&
-                fs_mgr_wait_for_file(scratch_device, 10s)) {
+                WaitForFile(scratch_device, 10s)) {
                 const auto mount_type = fs_mgr_overlayfs_scratch_mount_type();
                 if (fs_mgr_overlayfs_mount_scratch(scratch_device, mount_type,
                                                    true /* readonly */)) {
@@ -1130,11 +1191,15 @@ bool fs_mgr_overlayfs_teardown(const char* mount_point, bool* change) {
     if ((mount_point != nullptr) && !fs_mgr_overlayfs_already_mounted(kScratchMountPoint, false)) {
         auto scratch_device = fs_mgr_overlayfs_scratch_device();
         if (scratch_device.empty()) {
-            auto slot_number = fs_mgr_overlayfs_slot_number();
-            auto super_device = fs_mgr_overlayfs_super_device(slot_number);
-            const auto partition_name = android::base::Basename(kScratchMountPoint);
-            CreateLogicalPartition(super_device, slot_number, partition_name, true, 10s,
-                                   &scratch_device);
+            auto metadata_slot = fs_mgr_overlayfs_slot_number();
+            CreateLogicalPartitionParams params = {
+                    .block_device = fs_mgr_overlayfs_super_device(metadata_slot),
+                    .metadata_slot = metadata_slot,
+                    .partition_name = android::base::Basename(kScratchMountPoint),
+                    .force_writable = true,
+                    .timeout_ms = 10s,
+            };
+            CreateLogicalPartition(params, &scratch_device);
         }
         mount_scratch = fs_mgr_overlayfs_mount_scratch(scratch_device,
                                                        fs_mgr_overlayfs_scratch_mount_type());

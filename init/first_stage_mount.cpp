@@ -36,6 +36,7 @@
 #include <fs_mgr_overlayfs.h>
 #include <libgsi/libgsi.h>
 #include <liblp/liblp.h>
+#include <libsnapshot/snapshot.h>
 
 #include "devices.h"
 #include "switch_root.h"
@@ -55,6 +56,7 @@ using android::fs_mgr::FstabEntry;
 using android::fs_mgr::ReadDefaultFstab;
 using android::fs_mgr::ReadFstabFromDt;
 using android::fs_mgr::SkipMountingPartitions;
+using android::snapshot::SnapshotManager;
 
 using namespace std::literals;
 
@@ -244,8 +246,6 @@ bool FirstStageMount::DoFirstStageMount() {
 
     if (!InitDevices()) return false;
 
-    if (!CreateLogicalPartitions()) return false;
-
     if (!MountPartitions()) return false;
 
     return true;
@@ -276,14 +276,12 @@ bool FirstStageMount::GetDmLinearMetadataDevice() {
 // required_devices_partition_names_. Found partitions will then be removed from it
 // for the subsequent member function to check which devices are NOT created.
 bool FirstStageMount::InitRequiredDevices() {
-    if (required_devices_partition_names_.empty()) {
-        return true;
+    if (!InitDeviceMapper()) {
+        return false;
     }
 
-    if (IsDmLinearEnabled() || need_dm_verity_) {
-        if (!InitDeviceMapper()) {
-            return false;
-        }
+    if (required_devices_partition_names_.empty()) {
+        return true;
     }
 
     auto uevent_callback = [this](const Uevent& uevent) { return UeventCallback(uevent); };
@@ -366,6 +364,16 @@ bool FirstStageMount::CreateLogicalPartitions() {
         LOG(ERROR) << "Could not locate logical partition tables in partition "
                    << super_partition_name_;
         return false;
+    }
+
+    if (SnapshotManager::IsSnapshotManagerNeeded()) {
+        auto sm = SnapshotManager::NewForFirstStageMount();
+        if (!sm) {
+            return false;
+        }
+        if (sm->NeedSnapshotsInFirstStageMount()) {
+            return sm->CreateLogicalAndSnapshotPartitions(lp_metadata_partition_);
+        }
     }
 
     auto metadata = android::fs_mgr::ReadCurrentMetadata(lp_metadata_partition_);
@@ -495,14 +503,7 @@ bool FirstStageMount::MountPartition(const Fstab::iterator& begin, bool erase_sa
 // this case, we mount system first then pivot to it.  From that point on,
 // we are effectively identical to a system-as-root device.
 bool FirstStageMount::TrySwitchSystemAsRoot() {
-    auto metadata_partition = std::find_if(fstab_.begin(), fstab_.end(), [](const auto& entry) {
-        return entry.mount_point == "/metadata";
-    });
-    if (metadata_partition != fstab_.end()) {
-        if (MountPartition(metadata_partition, true /* erase_same_mounts */)) {
-            UseGsiIfPresent();
-        }
-    }
+    UseGsiIfPresent();
 
     auto system_partition = std::find_if(fstab_.begin(), fstab_.end(), [](const auto& entry) {
         return entry.mount_point == "/system";
@@ -525,6 +526,17 @@ bool FirstStageMount::TrySwitchSystemAsRoot() {
 }
 
 bool FirstStageMount::MountPartitions() {
+    // Mount /metadata before creating logical partitions, since we need to
+    // know whether a snapshot merge is in progress.
+    auto metadata_partition = std::find_if(fstab_.begin(), fstab_.end(), [](const auto& entry) {
+        return entry.mount_point == "/metadata";
+    });
+    if (metadata_partition != fstab_.end()) {
+        MountPartition(metadata_partition, true /* erase_same_mounts */);
+    }
+
+    if (!CreateLogicalPartitions()) return false;
+
     if (!TrySwitchSystemAsRoot()) return false;
 
     if (!SkipMountingPartitions(&fstab_)) return false;
@@ -604,25 +616,11 @@ void FirstStageMount::UseGsiIfPresent() {
         return;
     }
 
-    // Device-mapper might not be ready if the device doesn't use DAP or verity
-    // (for example, hikey).
-    if (access("/dev/device-mapper", F_OK) && !InitDeviceMapper()) {
-        return;
-    }
-
-    // Find the name of the super partition for the GSI. It will either be
-    // "userdata", or a block device such as an sdcard. There are no by-name
-    // partitions other than userdata that we support installing GSIs to.
+    // Find the super name. PartitionOpener will ensure this translates to the
+    // correct block device path.
     auto super = GetMetadataSuperBlockDevice(*metadata.get());
-    std::string super_name = android::fs_mgr::GetBlockDevicePartitionName(*super);
-    std::string super_path;
-    if (super_name == "userdata") {
-        super_path = "/dev/block/by-name/" + super_name;
-    } else {
-        super_path = "/dev/block/" + super_name;
-    }
-
-    if (!android::fs_mgr::CreateLogicalPartitions(*metadata.get(), super_path)) {
+    auto super_name = android::fs_mgr::GetBlockDevicePartitionName(*super);
+    if (!android::fs_mgr::CreateLogicalPartitions(*metadata.get(), super_name)) {
         LOG(ERROR) << "GSI partition layout could not be instantiated";
         return;
     }
@@ -644,7 +642,6 @@ void FirstStageMount::UseGsiIfPresent() {
 }
 
 bool FirstStageMountVBootV1::GetDmVerityDevices() {
-    std::string verity_loc_device;
     need_dm_verity_ = false;
 
     for (const auto& fstab_entry : fstab_) {
@@ -657,30 +654,14 @@ bool FirstStageMountVBootV1::GetDmVerityDevices() {
         if (fstab_entry.fs_mgr_flags.verify) {
             need_dm_verity_ = true;
         }
-        // Checks if verity metadata is on a separate partition. Note that it is
-        // not partition specific, so there must be only one additional partition
-        // that carries verity state.
-        if (!fstab_entry.verity_loc.empty()) {
-            if (verity_loc_device.empty()) {
-                verity_loc_device = fstab_entry.verity_loc;
-            } else if (verity_loc_device != fstab_entry.verity_loc) {
-                LOG(ERROR) << "More than one verity_loc found: " << verity_loc_device << ", "
-                           << fstab_entry.verity_loc;
-                return false;
-            }
-        }
     }
 
-    // Includes the partition names of fstab records and verity_loc_device (if any).
+    // Includes the partition names of fstab records.
     // Notes that fstab_rec->blk_device has A/B suffix updated by fs_mgr when A/B is used.
     for (const auto& fstab_entry : fstab_) {
         if (!fstab_entry.fs_mgr_flags.logical) {
             required_devices_partition_names_.emplace(basename(fstab_entry.blk_device.c_str()));
         }
-    }
-
-    if (!verity_loc_device.empty()) {
-        required_devices_partition_names_.emplace(basename(verity_loc_device.c_str()));
     }
 
     return true;
