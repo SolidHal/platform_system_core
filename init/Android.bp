@@ -95,7 +95,6 @@ cc_defaults {
         "libutils",
     ],
     bootstrap: true,
-    visibility: [":__subpackages__"],
 }
 
 cc_library_static {
